@@ -1,55 +1,80 @@
 const express = require('express');
 const router = express.Router();
 const { body, validationResult } = require('express-validator');
-const { db } = require('../db');
+const supabase = require('../supabase');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 
 const nameValidator = body('name').isLength({ min: 3, max: 200 }).withMessage('Store name 3-200 chars');
 const addressValidator = body('address').isLength({ max: 400 }).withMessage('Address max 400 chars');
 
 // Admin: add store
-router.post('/', authenticateToken, requireRole('Admin'), [nameValidator, addressValidator, body('owner_id').optional().isInt()], (req, res) => {
+router.post('/', authenticateToken, requireRole('Admin'), [nameValidator, addressValidator, body('owner_id').optional().isInt()], async (req, res) => {
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
-  const { name, address, owner_id } = req.body;
-  const stmt = db.prepare('INSERT INTO Stores (name, address, owner_id) VALUES (?, ?, ?)');
-  stmt.run(name, address || null, owner_id || null, function(err) {
-    if (err) return res.status(400).json({ message: err.message });
-    res.json({ id: this.lastID, name, address, owner_id });
-  });
+  try {
+    const { name, address, owner_id } = req.body;
+    const { data, error } = await supabase.from('stores').insert([{ name, address: address || null, owner_id: owner_id || null }]).select('id,name,address,owner_id');
+    if (error) return res.status(400).json({ message: error.message || error });
+    res.json(data && data[0] ? data[0] : {});
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 // Public: list stores with search & sort
-router.get('/', (req, res) => {
-  const { q, sortBy = 'name', order = 'asc' } = req.query;
-  let where = [];
-  let params = [];
-  if (q) { where.push('(name LIKE ? OR address LIKE ?)'); params.push(`%${q}%`, `%${q}%`); }
-  const whereSql = where.length ? 'WHERE ' + where.join(' AND ') : '';
-  const allowedSort = ['name','address','created_at'];
-  const col = allowedSort.includes(sortBy) ? sortBy : 'name';
-  const sql = `SELECT s.id, s.name, s.address, s.owner_id,
-    (SELECT AVG(rating) FROM Ratings r WHERE r.store_id = s.id) AS avg_rating
-    FROM Stores s ${whereSql} ORDER BY ${col} ${order.toUpperCase() === 'DESC' ? 'DESC' : 'ASC'}`;
-  db.all(sql, params, (err, rows) => {
-    if (err) return res.status(500).json({ message: err.message });
-    res.json(rows.map(r => ({ ...r, avg_rating: r.avg_rating ? Number(r.avg_rating).toFixed(2) : null })));
-  });
+router.get('/', async (req, res) => {
+  try {
+    const { q, sortBy = 'name', order = 'asc' } = req.query;
+    const allowedSort = ['name','address','created_at'];
+    const col = allowedSort.includes(sortBy) ? sortBy : 'name';
+
+    let builder = supabase.from('stores').select('id,name,address,owner_id,created_at');
+    if (q) builder = builder.or(`name.ilike.%${q}%,address.ilike.%${q}%`);
+    builder = builder.order(col, { ascending: order.toLowerCase() !== 'desc' });
+
+    const { data: stores, error } = await builder;
+    if (error) return res.status(500).json({ message: error.message || error });
+
+    // for each store, fetch avg rating
+    const results = [];
+    for (const s of (stores || [])) {
+      const { data: ratings, error: rerr } = await supabase.from('ratings').select('rating').eq('store_id', s.id);
+      if (rerr) return res.status(500).json({ message: rerr.message || rerr });
+      const avg = ratings && ratings.length ? (ratings.reduce((a,b)=>a+ b.rating,0)/ratings.length).toFixed(2) : null;
+      results.push({ ...s, avg_rating: avg });
+    }
+    res.json(results);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 // Store owner: view store details and raters
-router.get('/:id/owner-view', authenticateToken, requireRole('StoreOwner'), (req, res) => {
-  const storeId = parseInt(req.params.id, 10);
-  db.get('SELECT id, name, address, owner_id FROM Stores WHERE id = ?', [storeId], (err, store) => {
-    if (err) return res.status(500).json({ message: err.message });
+router.get('/:id/owner-view', authenticateToken, requireRole('StoreOwner'), async (req, res) => {
+  try {
+    const storeId = parseInt(req.params.id, 10);
+    const { data: store, error: sErr } = await supabase.from('stores').select('id,name,address,owner_id').eq('id', storeId).single();
+    if (sErr) return res.status(500).json({ message: sErr.message || sErr });
     if (!store) return res.status(404).json({ message: 'Store not found' });
     if (store.owner_id !== req.user.id && req.user.role !== 'Admin') return res.status(403).json({ message: 'Forbidden' });
-    db.all('SELECT u.id as user_id, u.name, u.email, r.rating, r.created_at FROM Ratings r JOIN Users u ON r.user_id = u.id WHERE r.store_id = ?', [storeId], (err2, rows) => {
-      if (err2) return res.status(500).json({ message: err2.message });
-      const avg = rows.length ? (rows.reduce((s,x)=>s+ x.rating,0)/rows.length).toFixed(2) : null;
-      res.json({ store, raters: rows, avg_rating: avg });
-    });
-  });
+
+    const { data: rows, error: rErr } = await supabase.from('ratings').select('rating,created_at,user_id').eq('store_id', storeId);
+    if (rErr) return res.status(500).json({ message: rErr.message || rErr });
+
+    // fetch user info for raters
+    const userIds = [...new Set((rows || []).map(r=>r.user_id))];
+    let usersMap = {};
+    if (userIds.length) {
+      const { data: users } = await supabase.from('users').select('id,name,email').in('id', userIds);
+      usersMap = (users || []).reduce((acc,u)=>{ acc[u.id]=u; return acc; }, {});
+    }
+
+    const raters = (rows || []).map(r => ({ user_id: r.user_id, name: usersMap[r.user_id]?.name || null, email: usersMap[r.user_id]?.email || null, rating: r.rating, created_at: r.created_at }));
+    const avg = raters.length ? (raters.reduce((s,x)=>s+ x.rating,0)/raters.length).toFixed(2) : null;
+    res.json({ store, raters, avg_rating: avg });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 module.exports = router;

@@ -1,42 +1,44 @@
 const express = require('express');
 const router = express.Router({ mergeParams: true });
 const { body, validationResult } = require('express-validator');
-const { db } = require('../db');
+const supabase = require('../supabase');
 const { authenticateToken, requireRole } = require('../middleware/auth');
 
-router.post('/', authenticateToken, requireRole('User'), [body('rating').isInt({ min: 1, max: 5 })], (req, res) => {
+router.post('/', authenticateToken, requireRole('User'), [body('rating').isInt({ min: 1, max: 5 })], async (req, res) => {
   const storeId = parseInt(req.params.id, 10);
   const userId = req.user.id;
   const errors = validationResult(req);
   if (!errors.isEmpty()) return res.status(400).json({ errors: errors.array() });
   const { rating } = req.body;
-  // upsert: try update first
-  db.run('UPDATE Ratings SET rating = ?, created_at = CURRENT_TIMESTAMP WHERE user_id = ? AND store_id = ?', [rating, userId, storeId], function(err) {
-    if (err) return res.status(500).json({ message: err.message });
-    if (this.changes) return res.json({ updated: true });
-    const stmt = db.prepare('INSERT INTO Ratings (user_id, store_id, rating) VALUES (?, ?, ?)');
-    stmt.run(userId, storeId, rating, function(err2) {
-      if (err2) return res.status(400).json({ message: err2.message });
-      res.json({ created: true, id: this.lastID });
-    });
-  });
+  try {
+    const payload = { user_id: userId, store_id: storeId, rating };
+    const { data, error } = await supabase.from('ratings').upsert([payload], { onConflict: 'user_id,store_id' }).select('id');
+    if (error) return res.status(400).json({ message: error.message || error });
+    res.json({ ok: true, id: data && data[0] ? data[0].id : null });
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 // Get overall and/or user's rating for a store
-router.get('/', (req, res) => {
+router.get('/', async (req, res) => {
   const storeId = parseInt(req.params.id, 10);
   const userId = req.query.user_id ? parseInt(req.query.user_id, 10) : null;
-  db.get('SELECT AVG(rating) as avg_rating, COUNT(*) as count FROM Ratings WHERE store_id = ?', [storeId], (err, row) => {
-    if (err) return res.status(500).json({ message: err.message });
-    const result = { avg_rating: row.avg_rating ? Number(row.avg_rating).toFixed(2) : null, count: row.count };
+  try {
+    const { data: allRatings, error } = await supabase.from('ratings').select('rating').eq('store_id', storeId);
+    if (error) return res.status(500).json({ message: error.message || error });
+    const count = allRatings ? allRatings.length : 0;
+    const avg = count ? (allRatings.reduce((s,x)=>s + x.rating, 0)/count).toFixed(2) : null;
+    const result = { avg_rating: avg, count };
     if (userId) {
-      db.get('SELECT rating FROM Ratings WHERE store_id = ? AND user_id = ?', [storeId, userId], (err2, r2) => {
-        if (err2) return res.status(500).json({ message: err2.message });
-        result.user_rating = r2 ? r2.rating : null;
-        res.json(result);
-      });
-    } else res.json(result);
-  });
+      const { data: ur, error: uerr } = await supabase.from('ratings').select('rating').eq('store_id', storeId).eq('user_id', userId).single();
+      if (uerr && uerr.code !== 'PGRST116') return res.status(500).json({ message: uerr.message || uerr });
+      result.user_rating = ur ? ur.rating : null;
+    }
+    res.json(result);
+  } catch (err) {
+    res.status(500).json({ message: err.message });
+  }
 });
 
 module.exports = router;

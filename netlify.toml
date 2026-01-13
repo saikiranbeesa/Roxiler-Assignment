@@ -1,0 +1,9 @@
+[build]
+  # install function deps (root) and build client
+  command = "npm install && npm --prefix client install && npm --prefix client run build"
+  publish = "client/dist"
+  functions = "netlify/functions"
+
+[dev]
+  command = "npm --prefix client run dev"
+  port = 5173
