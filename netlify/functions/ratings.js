@@ -4,14 +4,23 @@ const { jsonResponse, parseBody, verifyToken } = require('./_helpers');
 exports.handler = async function(event) {
   try {
     const pathParts = (event.path || '').split('/').filter(Boolean);
-    // path like /.netlify/functions/ratings or /.netlify/functions/ratings/:id
-    const storeId = pathParts.length >= 2 ? parseInt(pathParts[1], 10) : (event.queryStringParameters && parseInt(event.queryStringParameters.store_id,10));
+    // path can be like /.netlify/functions/ratings or /.netlify/functions/ratings/:id
+    // find the index of the function name 'ratings' and take the next segment as id if present
+    let storeId = null;
+    const idx = pathParts.indexOf('ratings');
+    if (idx !== -1 && pathParts.length > idx + 1) {
+      storeId = parseInt(pathParts[idx + 1], 10);
+    }
+    if (!storeId && event.queryStringParameters && event.queryStringParameters.store_id) {
+      storeId = parseInt(event.queryStringParameters.store_id, 10);
+    }
 
     if (event.httpMethod === 'POST') {
       const user = verifyToken(event);
       if (!user || user.role !== 'User') return jsonResponse(403, { message: 'Forbidden' });
       const body = parseBody(event);
       const rating = body.rating;
+      if (!storeId || Number.isNaN(storeId)) return jsonResponse(400, { message: 'Missing or invalid store id' });
       if (!Number.isInteger(rating) || rating < 1 || rating > 5) return jsonResponse(400, { message: 'Invalid rating' });
       const payload = { user_id: user.id, store_id: storeId, rating };
       const { data, error } = await supabase.from('ratings').upsert([payload], { onConflict: 'user_id,store_id' }).select('id');
@@ -20,6 +29,7 @@ exports.handler = async function(event) {
     }
 
     if (event.httpMethod === 'GET') {
+      if (!storeId || Number.isNaN(storeId)) return jsonResponse(400, { message: 'Missing or invalid store id' });
       const { data: allRatings, error } = await supabase.from('ratings').select('rating').eq('store_id', storeId);
       if (error) return jsonResponse(500, { message: error.message || error });
       const count = allRatings ? allRatings.length : 0;

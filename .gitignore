@@ -8,3 +8,6 @@ server/data.sqlite
 package-lock.json
 client/package-lock.json
 server/package-lock.json
+
+# Local Netlify folder
+.netlify
